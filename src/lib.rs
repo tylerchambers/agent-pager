@@ -6,6 +6,8 @@ use std::{env, fmt, path::Path, process::Command};
 pub const BOT_TOKEN_ENV: &str = "AGENT_PAGER_TELEGRAM_BOT_TOKEN";
 pub const CHAT_ID_ENV: &str = "AGENT_PAGER_TELEGRAM_CHAT_ID";
 pub const DEFAULT_HOST_ENV: &str = "AGENT_PAGER_DEFAULT_HOST";
+const BOT_TOKEN_PLACEHOLDER: &str = "replace-with-botfather-token";
+const CHAT_ID_PLACEHOLDER: &str = "replace-with-chat-id";
 
 const TELEGRAM_SEND_MESSAGE_PREFIX: &str = "https://api.telegram.org/bot";
 const ATTACH_INSTRUCTION: &str = "SSH in and attach tmux.";
@@ -73,10 +75,25 @@ fn required_value<F>(lookup: &F, key: &'static str) -> Result<String>
 where
     F: Fn(&str) -> Option<String>,
 {
-    lookup(key)
+    let value = lookup(key)
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| anyhow!("missing required environment variable {key}"))
+        .ok_or_else(|| anyhow!("missing required environment variable {key}"))?;
+    reject_placeholder_value(key, &value)?;
+    Ok(value)
+}
+
+fn reject_placeholder_value(key: &'static str, value: &str) -> Result<()> {
+    let is_placeholder = matches!(
+        (key, value),
+        (BOT_TOKEN_ENV, BOT_TOKEN_PLACEHOLDER) | (CHAT_ID_ENV, CHAT_ID_PLACEHOLDER)
+    );
+
+    if is_placeholder {
+        bail!("{key} still contains the example placeholder value");
+    }
+
+    Ok(())
 }
 
 fn fallback_host() -> String {
@@ -350,6 +367,37 @@ mod tests {
         assert_eq!(
             error.to_string(),
             "missing required environment variable AGENT_PAGER_TELEGRAM_CHAT_ID"
+        );
+    }
+
+    #[test]
+    fn rejects_example_placeholder_credentials() {
+        let vars = HashMap::from([
+            (BOT_TOKEN_ENV, BOT_TOKEN_PLACEHOLDER),
+            (CHAT_ID_ENV, CHAT_ID_PLACEHOLDER),
+        ]);
+        let error = PagerConfig::from_lookup(
+            |key| vars.get(key).map(|value| (*value).to_owned()),
+            "fallback",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "AGENT_PAGER_TELEGRAM_BOT_TOKEN still contains the example placeholder value"
+        );
+
+        let vars = HashMap::from([
+            (BOT_TOKEN_ENV, "123456:real-token-shape"),
+            (CHAT_ID_ENV, CHAT_ID_PLACEHOLDER),
+        ]);
+        let error = PagerConfig::from_lookup(
+            |key| vars.get(key).map(|value| (*value).to_owned()),
+            "fallback",
+        )
+        .unwrap_err();
+        assert_eq!(
+            error.to_string(),
+            "AGENT_PAGER_TELEGRAM_CHAT_ID still contains the example placeholder value"
         );
     }
 
