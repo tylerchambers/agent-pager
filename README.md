@@ -147,13 +147,19 @@ priority: high
 Tests failed in wallet descriptor parser.
 ```
 
-Text pages use Telegram `sendMessage` and are limited to 4096 characters after the pager header. For larger Markdown, logs you have sanitized, reports, or other files, send a document instead:
+Text pages use Telegram `sendMessage`. If a `MESSAGE` or `--stdin` body is too large for Telegram's 4096-character text limit after the pager header is added, `agent-pager` automatically uploads the body as `agent-pager-message.md` with a short caption:
+
+```bash
+generate-report | agent-pager send --stdin --document-name report.md
+```
+
+For an explicit Markdown, text, or report file, send a document:
 
 ```bash
 agent-pager send --document report.md "Review attached Markdown report"
 ```
 
-To stream generated Markdown without creating a file first:
+To stream a generated document without creating a file first:
 
 ```bash
 generate-report | agent-pager send --document - --document-name report.md "Review attached report"
@@ -167,6 +173,21 @@ agent-pager send --format html "<b>Build</b> failed in <code>parser</code>"
 ```
 
 Markdown document contents are uploaded unchanged as files. `--format markdown-v2` is Telegram MarkdownV2 for the short message or caption, not full CommonMark parsing.
+
+Before sending, `agent-pager` blocks obvious secret-looking content such as private keys, token prefixes, and `.env`-style secret assignments. Use `--allow-sensitive` only after manually reviewing the exact payload.
+
+Check local configuration without printing secrets:
+
+```bash
+agent-pager doctor
+```
+
+Install or refresh the bundled OMP skill:
+
+```bash
+agent-pager install-skill
+agent-pager install-skill --dry-run
+```
 
 If `--tmux` is passed outside tmux, the page includes:
 

@@ -13,6 +13,7 @@ const CHAT_ID_PLACEHOLDER: &str = "replace-with-chat-id";
 const TELEGRAM_SEND_MESSAGE_PREFIX: &str = "https://api.telegram.org/bot";
 pub const TELEGRAM_TEXT_MESSAGE_LIMIT: usize = 4096;
 pub const TELEGRAM_DOCUMENT_CAPTION_LIMIT: usize = 1024;
+pub const AUTO_DOCUMENT_FILE_NAME: &str = "agent-pager-message.md";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Priority {
@@ -200,14 +201,22 @@ fn current_tmux_session() -> Option<String> {
 }
 
 pub fn build_page_text(message: &str, priority: Priority, context: &PageContext) -> Result<String> {
+    let text = build_page_text_unlimited(message, priority, context)?;
+    validate_char_limit(&text, TELEGRAM_TEXT_MESSAGE_LIMIT, "Telegram text message")?;
+    Ok(text)
+}
+
+pub fn build_page_text_unlimited(
+    message: &str,
+    priority: Priority,
+    context: &PageContext,
+) -> Result<String> {
     let message = trim_required_message(message)?;
 
     let mut lines = page_prefix_lines(priority, context);
     lines.push(message.to_owned());
 
-    let text = lines.join("\n");
-    validate_char_limit(&text, TELEGRAM_TEXT_MESSAGE_LIMIT, "Telegram text message")?;
-    Ok(text)
+    Ok(lines.join("\n"))
 }
 
 pub fn build_document_caption(
@@ -269,6 +278,10 @@ fn validate_char_limit(input: &str, max_chars: usize, label: &str) -> Result<()>
     Ok(())
 }
 
+pub fn fits_telegram_text_message(text: &str) -> bool {
+    text.chars().count() <= TELEGRAM_TEXT_MESSAGE_LIMIT
+}
+
 pub fn build_test_text(host: &str) -> String {
     format!("agent-pager test from {}", host.trim())
 }
@@ -292,6 +305,122 @@ impl TelegramDocument {
 
         Ok(Self { file_name, bytes })
     }
+}
+
+pub fn scan_sensitive_text(label: &str, text: &str) -> Result<()> {
+    if let Some(reason) = sensitive_content_reason(text) {
+        bail!("refusing to send {label}: detected {reason}; pass --allow-sensitive to send anyway");
+    }
+
+    Ok(())
+}
+
+pub fn scan_sensitive_bytes(label: &str, bytes: &[u8]) -> Result<()> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        scan_sensitive_text(label, text)?;
+    }
+
+    Ok(())
+}
+
+fn sensitive_content_reason(text: &str) -> Option<&'static str> {
+    for line in text.lines() {
+        if line.contains("-----BEGIN") && line.contains("PRIVATE KEY-----") {
+            return Some("private key material");
+        }
+
+        let trimmed = line.trim();
+        if has_sensitive_assignment(trimmed) {
+            return Some("secret-looking assignment");
+        }
+
+        if contains_token_prefix(trimmed) {
+            return Some("token-looking value");
+        }
+
+        if contains_telegram_bot_token(trimmed) {
+            return Some("Telegram bot token");
+        }
+    }
+
+    None
+}
+
+fn has_sensitive_assignment(line: &str) -> bool {
+    let Some((key, value)) = line.split_once('=') else {
+        return false;
+    };
+
+    if value.trim().is_empty() {
+        return false;
+    }
+
+    let key = key
+        .trim()
+        .strip_prefix("export ")
+        .unwrap_or_else(|| key.trim())
+        .trim()
+        .to_ascii_uppercase();
+
+    matches!(
+        key.as_str(),
+        "TOKEN"
+            | "SECRET"
+            | "PASSWORD"
+            | "PASSWD"
+            | "API_KEY"
+            | "PRIVATE_KEY"
+            | "ACCESS_KEY"
+            | "COOKIE"
+            | "SESSION"
+            | "SESSION_ID"
+    ) || key.ends_with("_TOKEN")
+        || key.ends_with("_SECRET")
+        || key.ends_with("_PASSWORD")
+        || key.ends_with("_PASSWD")
+        || key.ends_with("_API_KEY")
+        || key.ends_with("_PRIVATE_KEY")
+        || key.ends_with("_ACCESS_KEY")
+        || key.ends_with("_COOKIE")
+        || key.ends_with("_SESSION")
+        || key.ends_with("_SESSION_ID")
+}
+
+fn contains_token_prefix(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("github_pat_")
+        || lower.contains("ghp_")
+        || lower.contains("gho_")
+        || lower.contains("ghu_")
+        || lower.contains("ghs_")
+        || lower.contains("ghr_")
+        || lower.contains("xoxb-")
+        || lower.contains("xoxp-")
+        || line.contains("AKIA")
+}
+
+fn contains_telegram_bot_token(line: &str) -> bool {
+    line.split(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+    })
+    .any(is_telegram_bot_token)
+}
+
+fn is_telegram_bot_token(token: &str) -> bool {
+    let Some((bot_id, secret)) = token.split_once(':') else {
+        return false;
+    };
+
+    bot_id.len() >= 5
+        && bot_id.bytes().all(|byte| byte.is_ascii_digit())
+        && secret.len() >= 20
+        && secret
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 #[derive(Debug, Serialize)]
@@ -528,6 +657,43 @@ mod tests {
             error.to_string(),
             "Telegram text message is 4 characters; Telegram limit is 3 characters"
         );
+    }
+
+    #[test]
+    fn builds_unlimited_page_text_without_telegram_limit() {
+        let context = PageContext {
+            host: "desktop".to_owned(),
+            cwd: None,
+            tmux: None,
+        };
+        let message = "a".repeat(TELEGRAM_TEXT_MESSAGE_LIMIT);
+
+        let text = build_page_text_unlimited(&message, Priority::Normal, &context)
+            .expect("unlimited page text");
+
+        assert!(!fits_telegram_text_message(&text));
+    }
+
+    #[test]
+    fn detects_sensitive_text_patterns() {
+        let error = scan_sensitive_text("message", "AGENT_PAGER_TELEGRAM_BOT_TOKEN=123456:secret")
+            .expect_err("secret assignment");
+        assert_eq!(
+            error.to_string(),
+            "refusing to send message: detected secret-looking assignment; pass --allow-sensitive to send anyway"
+        );
+
+        let error = scan_sensitive_text("message", "token ghp_12345678901234567890")
+            .expect_err("token prefix");
+        assert_eq!(
+            error.to_string(),
+            "refusing to send message: detected token-looking value; pass --allow-sensitive to send anyway"
+        );
+    }
+
+    #[test]
+    fn ignores_non_utf8_document_bytes_for_sensitive_scan() {
+        scan_sensitive_bytes("document", &[0xff, 0xfe, 0xfd]).expect("non-utf8 skipped");
     }
 
     #[test]
