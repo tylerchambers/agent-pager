@@ -2,21 +2,19 @@
 
 A tiny Rust CLI for paging via Telegram when an agent needs attention.
 
-It is meant for agent sessions, shell scripts, tmux hooks, and tools that need to send a terse notification without depending on Oh My Pi internals.
+It is meant for agent sessions, shell scripts, tmux hooks, and tools that need to send a notification, rich caption, or larger Markdown/text document without depending on Oh My Pi internals.
 
 ## Security model
 
 Telegram is a pager, not a secure transport.
 
-Do not send:
+Do not send sensitive content:
 
 - secrets
-- logs
-- stack traces
-- diffs
 - credentials
 - URLs with tokens
 - customer data
+- private logs, stack traces, or diffs
 
 Store the Telegram bot token only in your shell environment, a local ignored `.env`, or another local secret manager. If a bot token is accidentally committed or pasted somewhere public, rotate it with BotFather.
 
@@ -126,13 +124,13 @@ agent-pager test from desktop
 
 ## Usage
 
-Basic page:
+Basic text page:
 
 ```bash
 agent-pager send "Agent needs review"
 ```
 
-High-priority page with working directory and tmux session:
+High-priority page with working directory and tmux session metadata:
 
 ```bash
 agent-pager send --priority high --cwd --tmux "Tests failed in wallet descriptor parser"
@@ -147,8 +145,28 @@ cwd: ~/src/walletd
 tmux: main
 priority: high
 Tests failed in wallet descriptor parser.
-SSH in and attach tmux.
 ```
+
+Text pages use Telegram `sendMessage` and are limited to 4096 characters after the pager header. For larger Markdown, logs you have sanitized, reports, or other files, send a document instead:
+
+```bash
+agent-pager send --document report.md "Review attached Markdown report"
+```
+
+To stream generated Markdown without creating a file first:
+
+```bash
+generate-report | agent-pager send --document - --document-name report.md "Review attached report"
+```
+
+`--format` controls Telegram rendering for text messages and document captions:
+
+```bash
+agent-pager send --format markdown-v2 "*Build* failed in `parser`"
+agent-pager send --format html "<b>Build</b> failed in <code>parser</code>"
+```
+
+Markdown document contents are uploaded unchanged as files. `--format markdown-v2` is Telegram MarkdownV2 for the short message or caption, not full CommonMark parsing.
 
 If `--tmux` is passed outside tmux, the page includes:
 
