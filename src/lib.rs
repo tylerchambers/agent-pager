@@ -1,5 +1,6 @@
 use anyhow::{Result, anyhow, bail};
 use clap::ValueEnum;
+use reqwest::multipart::{Form, Part};
 use serde::Serialize;
 use std::{env, fmt, path::Path, process::Command};
 
@@ -10,7 +11,9 @@ const BOT_TOKEN_PLACEHOLDER: &str = "replace-with-botfather-token";
 const CHAT_ID_PLACEHOLDER: &str = "replace-with-chat-id";
 
 const TELEGRAM_SEND_MESSAGE_PREFIX: &str = "https://api.telegram.org/bot";
-const ATTACH_INSTRUCTION: &str = "SSH in and attach tmux.";
+pub const TELEGRAM_TEXT_MESSAGE_LIMIT: usize = 4096;
+pub const TELEGRAM_DOCUMENT_CAPTION_LIMIT: usize = 1024;
+pub const AUTO_DOCUMENT_FILE_NAME: &str = "agent-pager-message.md";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub enum Priority {
@@ -35,6 +38,38 @@ impl Priority {
 }
 
 impl fmt::Display for Priority {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MessageFormat {
+    Plain,
+    #[value(name = "markdown-v2")]
+    MarkdownV2,
+    Html,
+}
+
+impl MessageFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Plain => "plain",
+            Self::MarkdownV2 => "markdown-v2",
+            Self::Html => "html",
+        }
+    }
+
+    pub fn telegram_parse_mode(self) -> Option<&'static str> {
+        match self {
+            Self::Plain => None,
+            Self::MarkdownV2 => Some("MarkdownV2"),
+            Self::Html => Some("HTML"),
+        }
+    }
+}
+
+impl fmt::Display for MessageFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
@@ -166,12 +201,46 @@ fn current_tmux_session() -> Option<String> {
 }
 
 pub fn build_page_text(message: &str, priority: Priority, context: &PageContext) -> Result<String> {
-    let message = message.trim();
-    if message.is_empty() {
-        bail!("page message cannot be empty");
+    let text = build_page_text_unlimited(message, priority, context)?;
+    validate_char_limit(&text, TELEGRAM_TEXT_MESSAGE_LIMIT, "Telegram text message")?;
+    Ok(text)
+}
+
+pub fn build_page_text_unlimited(
+    message: &str,
+    priority: Priority,
+    context: &PageContext,
+) -> Result<String> {
+    let message = trim_required_message(message)?;
+
+    let mut lines = page_prefix_lines(priority, context);
+    lines.push(message.to_owned());
+
+    Ok(lines.join("\n"))
+}
+
+pub fn build_document_caption(
+    message: Option<&str>,
+    priority: Priority,
+    context: &PageContext,
+) -> Result<String> {
+    let mut lines = page_prefix_lines(priority, context);
+
+    if let Some(message) = trim_optional_message(message) {
+        lines.push(message.to_owned());
     }
 
-    let mut lines = Vec::with_capacity(7);
+    let caption = lines.join("\n");
+    validate_char_limit(
+        &caption,
+        TELEGRAM_DOCUMENT_CAPTION_LIMIT,
+        "Telegram document caption",
+    )?;
+    Ok(caption)
+}
+
+fn page_prefix_lines(priority: Priority, context: &PageContext) -> Vec<String> {
+    let mut lines = Vec::with_capacity(6);
     lines.push(priority.header().to_owned());
     lines.push(format!("host: {}", context.host));
 
@@ -184,14 +253,174 @@ pub fn build_page_text(message: &str, priority: Priority, context: &PageContext)
     }
 
     lines.push(format!("priority: {priority}"));
-    lines.push(message.to_owned());
-    lines.push(ATTACH_INSTRUCTION.to_owned());
+    lines
+}
 
-    Ok(lines.join("\n"))
+fn trim_required_message(message: &str) -> Result<&str> {
+    let message = message.trim();
+    if message.is_empty() {
+        bail!("page message cannot be empty");
+    }
+
+    Ok(message)
+}
+
+fn trim_optional_message(message: Option<&str>) -> Option<&str> {
+    message.map(str::trim).filter(|message| !message.is_empty())
+}
+
+fn validate_char_limit(input: &str, max_chars: usize, label: &str) -> Result<()> {
+    let char_count = input.chars().count();
+    if char_count > max_chars {
+        bail!("{label} is {char_count} characters; Telegram limit is {max_chars} characters");
+    }
+
+    Ok(())
+}
+
+pub fn fits_telegram_text_message(text: &str) -> bool {
+    text.chars().count() <= TELEGRAM_TEXT_MESSAGE_LIMIT
 }
 
 pub fn build_test_text(host: &str) -> String {
     format!("agent-pager test from {}", host.trim())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TelegramDocument {
+    pub file_name: String,
+    pub bytes: Vec<u8>,
+}
+
+impl TelegramDocument {
+    pub fn new(file_name: impl Into<String>, bytes: Vec<u8>) -> Result<Self> {
+        let file_name = file_name.into().trim().to_owned();
+        if file_name.is_empty() {
+            bail!("document file name cannot be empty");
+        }
+
+        if bytes.is_empty() {
+            bail!("document cannot be empty");
+        }
+
+        Ok(Self { file_name, bytes })
+    }
+}
+
+pub fn scan_sensitive_text(label: &str, text: &str) -> Result<()> {
+    if let Some(reason) = sensitive_content_reason(text) {
+        bail!("refusing to send {label}: detected {reason}; pass --allow-sensitive to send anyway");
+    }
+
+    Ok(())
+}
+
+pub fn scan_sensitive_bytes(label: &str, bytes: &[u8]) -> Result<()> {
+    if let Ok(text) = std::str::from_utf8(bytes) {
+        scan_sensitive_text(label, text)?;
+    }
+
+    Ok(())
+}
+
+fn sensitive_content_reason(text: &str) -> Option<&'static str> {
+    for line in text.lines() {
+        if line.contains("-----BEGIN") && line.contains("PRIVATE KEY-----") {
+            return Some("private key material");
+        }
+
+        let trimmed = line.trim();
+        if has_sensitive_assignment(trimmed) {
+            return Some("secret-looking assignment");
+        }
+
+        if contains_token_prefix(trimmed) {
+            return Some("token-looking value");
+        }
+
+        if contains_telegram_bot_token(trimmed) {
+            return Some("Telegram bot token");
+        }
+    }
+
+    None
+}
+
+fn has_sensitive_assignment(line: &str) -> bool {
+    let Some((key, value)) = line.split_once('=') else {
+        return false;
+    };
+
+    if value.trim().is_empty() {
+        return false;
+    }
+
+    let key = key
+        .trim()
+        .strip_prefix("export ")
+        .unwrap_or_else(|| key.trim())
+        .trim()
+        .to_ascii_uppercase();
+
+    matches!(
+        key.as_str(),
+        "TOKEN"
+            | "SECRET"
+            | "PASSWORD"
+            | "PASSWD"
+            | "API_KEY"
+            | "PRIVATE_KEY"
+            | "ACCESS_KEY"
+            | "COOKIE"
+            | "SESSION"
+            | "SESSION_ID"
+    ) || key.ends_with("_TOKEN")
+        || key.ends_with("_SECRET")
+        || key.ends_with("_PASSWORD")
+        || key.ends_with("_PASSWD")
+        || key.ends_with("_API_KEY")
+        || key.ends_with("_PRIVATE_KEY")
+        || key.ends_with("_ACCESS_KEY")
+        || key.ends_with("_COOKIE")
+        || key.ends_with("_SESSION")
+        || key.ends_with("_SESSION_ID")
+}
+
+fn contains_token_prefix(line: &str) -> bool {
+    let lower = line.to_ascii_lowercase();
+    lower.contains("github_pat_")
+        || lower.contains("ghp_")
+        || lower.contains("gho_")
+        || lower.contains("ghu_")
+        || lower.contains("ghs_")
+        || lower.contains("ghr_")
+        || lower.contains("xoxb-")
+        || lower.contains("xoxp-")
+        || line.contains("AKIA")
+}
+
+fn contains_telegram_bot_token(line: &str) -> bool {
+    line.split(|character: char| {
+        character.is_whitespace()
+            || matches!(
+                character,
+                '"' | '\'' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}'
+            )
+    })
+    .any(is_telegram_bot_token)
+}
+
+fn is_telegram_bot_token(token: &str) -> bool {
+    let Some((bot_id, secret)) = token.split_once(':') else {
+        return false;
+    };
+
+    bot_id.len() >= 5
+        && bot_id.bytes().all(|byte| byte.is_ascii_digit())
+        && secret.len() >= 20
+        && secret
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-')
 }
 
 #[derive(Debug, Serialize)]
@@ -199,6 +428,8 @@ struct TelegramSendMessage<'a> {
     chat_id: &'a str,
     text: &'a str,
     disable_web_page_preview: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    parse_mode: Option<&'static str>,
 }
 
 pub async fn send_telegram_message(
@@ -206,14 +437,23 @@ pub async fn send_telegram_message(
     config: &PagerConfig,
     text: &str,
 ) -> Result<()> {
-    let endpoint = format!(
-        "{}{}/sendMessage",
-        TELEGRAM_SEND_MESSAGE_PREFIX, config.bot_token
-    );
+    send_telegram_message_with_format(client, config, text, MessageFormat::Plain).await
+}
+
+pub async fn send_telegram_message_with_format(
+    client: &reqwest::Client,
+    config: &PagerConfig,
+    text: &str,
+    format: MessageFormat,
+) -> Result<()> {
+    validate_char_limit(text, TELEGRAM_TEXT_MESSAGE_LIMIT, "Telegram text message")?;
+
+    let endpoint = telegram_endpoint(config, "sendMessage");
     let payload = TelegramSendMessage {
         chat_id: &config.chat_id,
         text,
         disable_web_page_preview: true,
+        parse_mode: format.telegram_parse_mode(),
     };
 
     let response = client
@@ -228,11 +468,71 @@ pub async fn send_telegram_message(
             )
         })?;
 
+    ensure_telegram_success(response, config, "sendMessage").await
+}
+
+pub async fn send_telegram_document(
+    client: &reqwest::Client,
+    config: &PagerConfig,
+    document: TelegramDocument,
+    caption: Option<&str>,
+    format: MessageFormat,
+) -> Result<()> {
+    let caption = trim_optional_message(caption);
+    if let Some(caption) = caption {
+        validate_char_limit(
+            caption,
+            TELEGRAM_DOCUMENT_CAPTION_LIMIT,
+            "Telegram document caption",
+        )?;
+    }
+
+    let endpoint = telegram_endpoint(config, "sendDocument");
+    let TelegramDocument { file_name, bytes } = document;
+    let document_part = Part::bytes(bytes).file_name(file_name);
+    let mut form = Form::new()
+        .text("chat_id", config.chat_id.clone())
+        .part("document", document_part);
+
+    if let Some(caption) = caption {
+        form = form.text("caption", caption.to_owned());
+        if let Some(parse_mode) = format.telegram_parse_mode() {
+            form = form.text("parse_mode", parse_mode.to_owned());
+        }
+    }
+
+    let response = client
+        .post(endpoint)
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|err| {
+            anyhow!(
+                "failed to call Telegram sendDocument: {}",
+                redact_token(&err.to_string(), &config.bot_token)
+            )
+        })?;
+
+    ensure_telegram_success(response, config, "sendDocument").await
+}
+
+fn telegram_endpoint(config: &PagerConfig, method: &str) -> String {
+    format!(
+        "{}{}/{}",
+        TELEGRAM_SEND_MESSAGE_PREFIX, config.bot_token, method
+    )
+}
+
+async fn ensure_telegram_success(
+    response: reqwest::Response,
+    config: &PagerConfig,
+    method: &str,
+) -> Result<()> {
     let status = response.status();
     if !status.is_success() {
         let body = response.text().await.unwrap_or_default();
         bail!(
-            "Telegram sendMessage failed with status {status}: {}",
+            "Telegram {method} failed with status {status}: {}",
             truncate(&redact_token(&body, &config.bot_token), 512)
         );
     }
@@ -280,7 +580,7 @@ mod tests {
 
         assert_eq!(
             text,
-            "🟡 Agent needs attention\nhost: desktop\ncwd: ~/src/walletd\ntmux: main\npriority: normal\nTests failed in descriptor parser.\nSSH in and attach tmux."
+            "🟡 Agent needs attention\nhost: desktop\ncwd: ~/src/walletd\ntmux: main\npriority: normal\nTests failed in descriptor parser."
         );
     }
 
@@ -297,8 +597,112 @@ mod tests {
 
         assert_eq!(
             text,
-            "🔴 Agent needs attention\nhost: buildbox\npriority: high\nNeed review\nSSH in and attach tmux."
+            "🔴 Agent needs attention\nhost: buildbox\npriority: high\nNeed review"
         );
+    }
+
+    #[test]
+    fn builds_document_caption_without_requiring_message() {
+        let context = PageContext {
+            host: "desktop".to_owned(),
+            cwd: Some("~/src/walletd".to_owned()),
+            tmux: None,
+        };
+
+        let caption =
+            build_document_caption(None, Priority::Normal, &context).expect("valid caption");
+
+        assert_eq!(
+            caption,
+            "🟡 Agent needs attention\nhost: desktop\ncwd: ~/src/walletd\npriority: normal"
+        );
+    }
+
+    #[test]
+    fn builds_document_caption_with_optional_message() {
+        let context = PageContext {
+            host: "desktop".to_owned(),
+            cwd: None,
+            tmux: Some("main".to_owned()),
+        };
+
+        let caption = build_document_caption(
+            Some("  See attached markdown report.  "),
+            Priority::High,
+            &context,
+        )
+        .expect("valid caption");
+
+        assert_eq!(
+            caption,
+            "🔴 Agent needs attention\nhost: desktop\ntmux: main\npriority: high\nSee attached markdown report."
+        );
+    }
+
+    #[test]
+    fn maps_message_formats_to_telegram_parse_modes() {
+        assert_eq!(MessageFormat::Plain.telegram_parse_mode(), None);
+        assert_eq!(
+            MessageFormat::MarkdownV2.telegram_parse_mode(),
+            Some("MarkdownV2")
+        );
+        assert_eq!(MessageFormat::Html.telegram_parse_mode(), Some("HTML"));
+    }
+
+    #[test]
+    fn rejects_text_over_telegram_limits() {
+        let error = validate_char_limit("abcd", 3, "Telegram text message").expect_err("too long");
+
+        assert_eq!(
+            error.to_string(),
+            "Telegram text message is 4 characters; Telegram limit is 3 characters"
+        );
+    }
+
+    #[test]
+    fn builds_unlimited_page_text_without_telegram_limit() {
+        let context = PageContext {
+            host: "desktop".to_owned(),
+            cwd: None,
+            tmux: None,
+        };
+        let message = "a".repeat(TELEGRAM_TEXT_MESSAGE_LIMIT);
+
+        let text = build_page_text_unlimited(&message, Priority::Normal, &context)
+            .expect("unlimited page text");
+
+        assert!(!fits_telegram_text_message(&text));
+    }
+
+    #[test]
+    fn detects_sensitive_text_patterns() {
+        let error = scan_sensitive_text("message", "AGENT_PAGER_TELEGRAM_BOT_TOKEN=123456:secret")
+            .expect_err("secret assignment");
+        assert_eq!(
+            error.to_string(),
+            "refusing to send message: detected secret-looking assignment; pass --allow-sensitive to send anyway"
+        );
+
+        let error = scan_sensitive_text("message", "token ghp_12345678901234567890")
+            .expect_err("token prefix");
+        assert_eq!(
+            error.to_string(),
+            "refusing to send message: detected token-looking value; pass --allow-sensitive to send anyway"
+        );
+    }
+
+    #[test]
+    fn ignores_non_utf8_document_bytes_for_sensitive_scan() {
+        scan_sensitive_bytes("document", &[0xff, 0xfe, 0xfd]).expect("non-utf8 skipped");
+    }
+
+    #[test]
+    fn rejects_invalid_document_inputs() {
+        let error = TelegramDocument::new("   ", vec![1]).expect_err("empty file name");
+        assert_eq!(error.to_string(), "document file name cannot be empty");
+
+        let error = TelegramDocument::new("report.md", Vec::new()).expect_err("empty file");
+        assert_eq!(error.to_string(), "document cannot be empty");
     }
 
     #[test]
